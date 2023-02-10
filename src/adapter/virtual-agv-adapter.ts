@@ -33,7 +33,8 @@ import {
     StopTraverseContext,
     TraverseEdgeContext,
     Velocity,
-} from "..";
+} from "../../vda-5050-lib/src";
+import { getEndLocPosX, getEndLocPosY } from "../vda_sim";
 
 /**
  * Represents the internal vehicle state of a virtual AGV.
@@ -43,7 +44,7 @@ import {
 export interface VirtualAgvState {
     isDriving: boolean;
     isPaused: boolean;
-    position: AgvPosition & { lastNodeId: string };
+    position: AgvPosition;
     velocity: Velocity;
     batteryState: BatteryState;
     safetyState: SafetyStatus;
@@ -174,12 +175,8 @@ export type VirtualActionTransitions = {
     [ActionStatus.Initializing]?: {
         /**
          * Time in seconds to stay in this status.
-         *
-         * Specify either a number of seconds or a tuple with the name of the
-         * action parameter whose numeric value should be taken and a default
-         * value to be taken if this action parameter is not existing.
          */
-        durationTime: number | [string, number],
+        durationTime: number,
 
         /**
          * The next status to transition to after the duration time elapses.
@@ -200,12 +197,8 @@ export type VirtualActionTransitions = {
     [ActionStatus.Running]?: {
         /**
          * Time in seconds to stay in this status.
-         *
-         * Specify either a number of seconds or a tuple with the name of the
-         * action parameter whose numeric value should be taken and a default
-         * value to be taken if this action parameter is not existing.
          */
-        durationTime: number | [string, number],
+        durationTime: number,
 
         /**
          * The next status to transition to after the duration time elapses.
@@ -273,9 +266,9 @@ export interface VirtualAgvAdapterOptions extends AgvAdapterOptions {
      * range [-Pi ... Pi].
      *
      * If not specified, the position defaults to `{ mapId: "local", x: 0, y: 0,
-     * theta: 0, lastNodeId: "0" }`.
+     * theta: 0 }`.
      */
-    initialPosition?: { mapId: string, x: number, y: number, theta: number, lastNodeId: string };
+    initialPosition?: { mapId: string, x: number, y: number, theta: number };
 
     /**
      * Specifies the AGV's normal deviation x/y tolerance (in meter) if no
@@ -301,13 +294,12 @@ export interface VirtualAgvAdapterOptions extends AgvAdapterOptions {
      *
      * If not specified, value defaults to 2 m/s.
      *
-     * @remarks
-     * A virtual AGV is assumed to have the same forward and cornering speed, as
-     * well as infinite acceleration and deceleration. If the specified speed is
-     * greater than the maximum speed on a order's edge the speed is adjusted
-     * accordingly.
+     * @remarks A virtual AGV is assumed to have the same forward and cornering
+     * speed, as well as infinite acceleration and deceleration. If the
+     * specified speed is greater than the maximum speed on a order's edge the
+     * speed is adjusted accordingly.
      *
-     * The options `vehicleSpeed`, `vehicleSpeedDistribution`, and
+     * @remarks The options `vehicleSpeed`, `vehicleSpeedDistribution`, and
      * `vehicleTimeDistribution` are mutually exclusive. Specify at most one of
      * them. If none is specified, the default value of the option
      * `vehicleSpeed` is applied.
@@ -355,14 +347,22 @@ export interface VirtualAgvAdapterOptions extends AgvAdapterOptions {
     vehicleTimeDistribution?: () => [number, number];
 
     /**
-     * Maximum reach in meter of an AGV with a fully charged battery (optional).
+     * Capacity of the AGV's battery measured in ampere hours (Ah) (optional).
      *
-     * If not specified, value defaults to 28800 meter (i.e. 4 hours travel time
-     * at a speed of 2m/s).
+     * If not specified, value defaults to 100 Ah.
+     */
+    batteryCapacity?: number;
+
+    /**
+     * Maximum reach in meter of an AGV with a fully charged battery with the
+     * capacity specified by option `batteryCapacity` (optional).
      *
      * @remarks This option doesn't take the actual speed of the AGV into
      * account. To keep it simple it is just a rough approximation of the real
      * physics.
+     *
+     * If not specified, value defaults to 28800 meter (i.e. 4 hours travel time
+     * at a speed of 2m/s).
      */
     batteryMaxReach?: number;
 
@@ -386,10 +386,10 @@ export interface VirtualAgvAdapterOptions extends AgvAdapterOptions {
      * and reports a corresponding error state with error type
      * `"batteryLowError"` and error level FATAL.
      *
-     * If not specified, value defaults to 1 percent.
-     *
      * @remarks While charging `"batteryLowError"` is removed from state again
      * as soon as charge advances 10% above this threshold.
+     *
+     * If not specified, value defaults to 1 percent.
      */
     lowBatteryChargeThreshold?: number;
 
@@ -423,8 +423,7 @@ export interface VirtualAgvAdapterOptions extends AgvAdapterOptions {
  * environments where real AGVs are not available or must be mocked.
  *
  * The following actions are supported:
- * - noop [instant, node, edge]
- * - pick/drop [node],
+ * - pick/drop [instant, node],
  * - initPosition [instant, node]
  * - startPause/stopPause [instant]
  * - startCharging/stopCharging [instant, node]
@@ -432,51 +431,43 @@ export interface VirtualAgvAdapterOptions extends AgvAdapterOptions {
  * - stateRequest [instant, supported by AgvController]
  * - orderExecutionTime [instant (custom)]
  *
- * The actions noop, pick, drop, startCharging, and stopCharging accept an
- * optional action parameter named "duration" that specifies the number of
- * seconds to stay in action state RUNNING. If not specified all these actions
- * stay running for 5 seconds. Note that pick and drop actions stay in status
- * INITIALIZING for 1 additional second.
+ * @remarks To be executable by the virtual AGV an order must specify
+ * `nodePosition` for all nodes except for the first one as VDA 5050 requires
+ * the vehicle to be already positioned on the first node (within a given
+ * deviation range). The property `nodeId` alone is not usable as a symbolic
+ * position.
  *
- * @remarks
- * To be executable by the virtual AGV an order must specify `nodePosition` for
- * all nodes except for the first one as VDA 5050 requires the vehicle to be
- * already positioned on the first node (within a given deviation range). The
- * property `nodeId` alone is not usable as a symbolic position.
+ * @remarks On initialization, the virtual AGV is positioned at `{ x: 0, y: 0,
+ * theta: 0}` relative to a map with mapId `local`. You can override or reset
+ * this pose using the instant or node action `initPosition`, specifying `x`,
+ * `y`, `theta`, `mapId`, `lastNodeId`, and `lastNodeSequenceId` (optional,
+ * defaults to
+ * 0) as action parameters.
  *
- * By default, when the virtual AGV is started, it is positioned at `{ x: 0, y:
- * 0, theta: 0, lastNodeId: "0" }` relative to a map with mapId `local`. You can
- * override this pose by supplying the option
- * `VirtualAgvAdapterOptions.initialPosition` when instantiating the virtual
- * AGV. In addition, you can override or reset this pose using the instant or
- * node action `initPosition`, specifying `x`, `y`, `theta`, `mapId`,
- * `lastNodeId`, and `lastNodeSequenceId` (optional, defaults to zero) as action
- * parameters.
+ * @remarks The virtual AGV provides a constant safety state where no e-stop is
+ * activated and where the protective field is never violated. The operating
+ * mode of the virtual AGV is always automatic, i.e. it is fully controlled by
+ * master control.
  *
- * The virtual AGV provides a constant safety state where no e-stop is activated
- * and where the protective field is never violated. The operating mode of the
- * virtual AGV is always automatic, i.e. it is fully controlled by master
- * control.
+ * @remarks The virtual AGV can only pick and carry one load at a time. Before
+ * picking another load the current load must have been dropped.
  *
- * The virtual AGV can only pick and carry one load at a time. Before picking
- * another load the current load must have been dropped.
- *
- * A charging action is executed on a charging spot while the vehicle is
- * standing, either as an instant action or as a node action. Charging mode is
- * either terminated explicitely by action stopCharging or automatically when
+ * @remarks A charging action is executed on a charging spot while the vehicle
+ * is standing, either as an instant action or as a node action. Charging mode
+ * is either terminated explicitely by action stopCharging or automatically when
  * the battery is fully charged.
  *
- * The AGV's remaining battery reach is reported in the `State.batteryState`
- * property unless the vehicle time distribution mode is active according to the
- * option `vehicleTimeDistribution`. When the AGV's battery runs low according
- * to the option `lowBatteryChargeThreshold` it stops driving and reports an
- * error of type `"batteryLowError"`. The master control must then initiate
- * further actions, e.g. cancel any active order or start charging. The battery
- * low error is removed from State as soon as battery charge advances 10% above
- * the configured threshold.
+ * @remarks The AGV's remaining battery reach is reported in the
+ * `State.batteryState` property unless the vehicle time distribution mode is
+ * active according to the option `vehicleTimeDistribution`. When the AGV's
+ * battery runs low according to the option `lowBatteryChargeThreshold` it stops
+ * driving and reports an error of type `"batteryLowError"`. The master control
+ * must then initiate further actions, e.g. cancel any active order or start
+ * charging. The battery low error is removed from State as soon as battery
+ * charge advances 10% above the configured threshold.
  *
- * The custom action `orderExecutionTime` expects an action parameter key
- * `orders` with an array of VDA 5050 headerless Order objects as parameter
+ * @remarks The custom action `orderExecutionTime` expects an action parameter
+ * key `orders` with an array of VDA 5050 headerless Order objects as parameter
  * value. The action finishes immediately reporting the estimated order
  * execution times in seconds as values in a comma-separated string format via
  * the `resultDescription` of the corresponding action state. The calculated
@@ -485,14 +476,13 @@ export interface VirtualAgvAdapterOptions extends AgvAdapterOptions {
  * well as the travel time on the order's edges, including both base and horizon
  * nodes and edges.
  *
- * To support benchmarking and performance measurement based on statistics the
- * virtual AGV also supports probabilistic distribution of driving speed or
- * driving time by corresponding adapter options.
+ * @remarks To support benchmarking and performance measurement based on
+ * statistics the virtual AGV also supports probabilistic distribution of
+ * driving speed or driving time by corresponding adapter options.
  *
  * @category AGV Adapter
  */
 export class VirtualAgvAdapter implements AgvAdapter {
-
     private readonly _controller: AgvController;
     private readonly _options: Required<VirtualAgvAdapterOptions>;
     private readonly _actionStateMachines: VirtualActionStateMachine[];
@@ -504,12 +494,11 @@ export class VirtualAgvAdapter implements AgvAdapter {
 
     constructor(
         controller: AgvController,
-        adapterOptions: VirtualAgvAdapterOptions,
-        public readonly debug: AgvAdapterDebugger) {
+        adapterOptions: VirtualAgvAdapterOptions) {
         this._controller = controller;
         this._options = this._optionsWithDefaults(adapterOptions);
         this._actionStateMachines = [];
-        this.debug("Create instance for apiVersion %d with adapterOptions %o", this.apiVersion, this.options);
+        console.log("Create instance for apiVersion %d with adapterOptions %o", this.apiVersion, this.options);
     }
 
     /**
@@ -540,7 +529,7 @@ export class VirtualAgvAdapter implements AgvAdapter {
             this._vehicleState = {
                 isDriving: false,
                 isPaused: false,
-                position: { positionInitialized: true, lastNodeId: "0", ...this.options.initialPosition },
+                position: { positionInitialized: true, ...this.options.initialPosition },
                 velocity: { omega: 0, vx: 0, vy: 0 },
                 batteryState: {
                     batteryCharge: this.options.initialBatteryCharge,
@@ -564,10 +553,8 @@ export class VirtualAgvAdapter implements AgvAdapter {
             this._onTick(++this._tick, tickInterval * this.options.timeLapse, realInterval * this.options.timeLapse / 1000);
         }, tickInterval);
 
-        const { lastNodeId, ...position } = this._vehicleState.position;
         context.attached({
-            agvPosition: position,
-            lastNodeId,
+            agvPosition: this._vehicleState.position,
             velocity: this._vehicleState.velocity,
             batteryState: this._vehicleState.batteryState,
             driving: this._vehicleState.isDriving,
@@ -602,7 +589,7 @@ export class VirtualAgvAdapter implements AgvAdapter {
             context,
             actionDef,
             () => this._finalizeAction(asm),
-            (formatter: any, ...args: any[]) => this.debug(formatter, ...args),
+            (formatter: any, ...args: any[]) => console.log(formatter, ...args),
             action.actionType === "stopPause" || action.actionType === "startPause" ? false : this._vehicleState.isPaused);
         // Start action on next tick.
         this._actionStateMachines.push(asm);
@@ -690,16 +677,13 @@ export class VirtualAgvAdapter implements AgvAdapter {
                     { referenceKey: "nodeId", referenceValue: node.nodeId },
                     { referenceKey: "nodePosition", referenceValue: "undefined" });
                 break;
+            } else if (node.nodePosition && node.nodePosition.mapId !== this._vehicleState.position.mapId) {
+                errorRefs.push(
+                    { referenceKey: AgvController.REF_KEY_ERROR_DESCRIPTION_DETAIL, referenceValue: "incorrect mapId" },
+                    { referenceKey: "nodeId", referenceValue: node.nodeId },
+                    { referenceKey: "nodePosition.mapId", referenceValue: this._vehicleState.position.mapId });
+                break;
             }
-            // mapId is allowed to change by an order node's initPosition action (e.g. elevator use case)
-            //
-            // else if (node.nodePosition && node.nodePosition.mapId !== this._vehicleState.position.mapId) {
-            //     errorRefs.push(
-            //         { referenceKey: AgvController.REF_KEY_ERROR_DESCRIPTION_DETAIL, referenceValue: "incorrect mapId" },
-            //         { referenceKey: "nodeId", referenceValue: node.nodeId },
-            //         { referenceKey: "nodePosition.mapId", referenceValue: this._vehicleState.position.mapId });
-            //     break;
-            // }
         }
 
         return errorRefs;
@@ -739,42 +723,14 @@ export class VirtualAgvAdapter implements AgvAdapter {
     protected get actionDefinitions(): VirtualActionDefinition[] {
         return [
             {
-                // No-op action just waits the number of seconds given by
-                // optional action parameter "duration" (default 5 seconds),
-                // then finishes.
-                actionType: "noop",
-                actionScopes: ["instant", "node", "edge"],
-                actionParameterConstraints: {
-                    duration: (value: number) => value === undefined || typeof value === "number",
-                },
-                transitions: {
-                    ON_INIT: { next: ActionStatus.Running },
-                    ON_CANCEL: {},
-
-                    // Wait given number of seconds.
-                    [ActionStatus.Running]: { durationTime: ["duration", 5], next: ActionStatus.Finished },
-
-                    // Noop has finished.
-                    [ActionStatus.Finished]: {
-                        resultDescription: () => "noop action finished",
-                    },
-
-                    [ActionStatus.Failed]: {
-                        errorDescription: () => "noop action failed",
-                    },
-                },
-            },
-            {
                 actionType: "pick",
-                actionScopes: "node",
+                actionScopes: ["instant", "node"],
                 actionParameterConstraints: {
                     // Station is a floor location.
-                    stationType: (value: string) => value && value.startsWith("floor"),
+                    // stationType: (value: string) => value && value.startsWith("floor") || value === "station",
 
                     // Can only lift EUR/EPAL-pallets.
-                    loadType: (value: string) => value === "EPAL",
-
-                    duration: (value: number) => value === undefined || typeof value === "number",
+                    loadType: (value: string) => value === "EPAL" || value === "",
                 },
                 // AGV can only pick and carry one load at a time.
                 actionExecutable: () => this._vehicleState.currentLoad ? "load already picked" : "",
@@ -783,10 +739,10 @@ export class VirtualAgvAdapter implements AgvAdapter {
                     ON_CANCEL: {},
 
                     // Initializing of the pick process, e.g. outstanding lift operations.
-                    [ActionStatus.Initializing]: { durationTime: 1, next: ActionStatus.Running },
+                    [ActionStatus.Initializing]: { durationTime: 5, next: ActionStatus.Running },
 
                     // The pick process is running.
-                    [ActionStatus.Running]: { durationTime: ["duration", 5], next: ActionStatus.Finished },
+                    [ActionStatus.Running]: { durationTime: 5, next: ActionStatus.Finished },
 
                     // Pick is done. Load has entered the AGV and AGV reports new load state.
                     [ActionStatus.Finished]: {
@@ -801,15 +757,13 @@ export class VirtualAgvAdapter implements AgvAdapter {
             },
             {
                 actionType: "drop",
-                actionScopes: "node",
+                actionScopes: ["instant", "node"],
                 actionParameterConstraints: {
                     // Station is a floor location.
-                    stationType: (value: string) => value && value.startsWith("floor"),
+                    // stationType: (value: string) => value && value.startsWith("floor") || value === "station",
 
                     // Can only lift EUR/EPAL-pallets.
-                    loadType: (value: string) => value === "EPAL",
-
-                    duration: (value: number) => value === undefined || typeof value === "number",
+                    loadType: (value: string) => value === "EPAL" || value === "",
                 },
                 actionExecutable: () => this._vehicleState.currentLoad ? "" : "no load to drop",
                 transitions: {
@@ -817,10 +771,10 @@ export class VirtualAgvAdapter implements AgvAdapter {
                     ON_CANCEL: {},
 
                     // Initializing of the drop process, e.g. outstanding lift operations.
-                    [ActionStatus.Initializing]: { durationTime: 1, next: ActionStatus.Running },
+                    [ActionStatus.Initializing]: { durationTime: 5, next: ActionStatus.Running },
 
                     // The drop process is running.
-                    [ActionStatus.Running]: { durationTime: ["duration", 5], next: ActionStatus.Finished },
+                    [ActionStatus.Running]: { durationTime: 5, next: ActionStatus.Finished },
 
                     // Drop is done. Load has left the AGV and AGV reports new load state.
                     [ActionStatus.Finished]: {
@@ -909,9 +863,6 @@ export class VirtualAgvAdapter implements AgvAdapter {
                 // against overcharging is handled by the vehicle.
                 actionType: "startCharging",
                 actionScopes: ["instant", "node"],
-                actionParameterConstraints: {
-                    duration: (value: number) => value === undefined || typeof value === "number",
-                },
                 actionExecutable: (action, scope, activeOrderId) => this._vehicleState.batteryState.charging ?
                     "charging already in progress" :
                     activeOrderId && scope === "instant" ? "charging denied as order is in progress" : "",
@@ -920,7 +871,7 @@ export class VirtualAgvAdapter implements AgvAdapter {
                     ON_CANCEL: {},
 
                     // Activation of the charging process is in progress (communication with charger is running).
-                    [ActionStatus.Running]: { durationTime: ["duration", 1], next: ActionStatus.Finished },
+                    [ActionStatus.Running]: { durationTime: 5, next: ActionStatus.Finished },
 
                     // The charging process is started. The AGV reports active charging state.
                     [ActionStatus.Finished]: {
@@ -939,16 +890,13 @@ export class VirtualAgvAdapter implements AgvAdapter {
                 // only allowed to be "false" when AGV is ready to receive orders.
                 actionType: "stopCharging",
                 actionScopes: ["instant", "node"],
-                actionParameterConstraints: {
-                    duration: (value: number) => value === undefined || typeof value === "number",
-                },
                 actionExecutable: () => this._vehicleState.batteryState.charging ? "" : "charging not in progress",
                 transitions: {
                     ON_INIT: { next: ActionStatus.Running },
                     ON_CANCEL: {},
 
                     // Deactivation of the charging process is in progress (communication with charger is running).
-                    [ActionStatus.Running]: { durationTime: ["duration", 1], next: ActionStatus.Finished },
+                    [ActionStatus.Running]: { durationTime: 5, next: ActionStatus.Finished },
 
                     // The charging process is stopped. The AGV reports inactive charging state.
                     [ActionStatus.Finished]: {
@@ -998,7 +946,7 @@ export class VirtualAgvAdapter implements AgvAdapter {
         this._vehicleState.velocity.vy = vy;
         this.controller.updateDrivingState(true);
         this.controller.updateAgvPositionVelocity(undefined, this._vehicleState.velocity, reportImmediately);
-        this.debug("start driving vx=%d, vy=%d", vx, vy);
+        console.log("start driving");
     }
 
     /**
@@ -1013,7 +961,7 @@ export class VirtualAgvAdapter implements AgvAdapter {
         this._vehicleState.velocity.vy = 0;
         this.controller.updateDrivingState(false);
         this.controller.updateAgvPositionVelocity(undefined, this._vehicleState.velocity, reportImmediately);
-        this.debug("stop driving");
+        console.log("stop driving");
     }
 
     /**
@@ -1028,9 +976,8 @@ export class VirtualAgvAdapter implements AgvAdapter {
         let state = actionDef.transitions.ON_INIT.next as ActionStatus;
         while (state !== ActionStatus.Finished && state !== ActionStatus.Failed) {
             const transition = actionDef.transitions[state];
-            const transitionDuration = getTransitionDuration(transition, action);
-            if (transitionDuration !== undefined) {
-                duration += transitionDuration;
+            if ("durationTime" in transition) {
+                duration += transition.durationTime;
             }
             state = transition.next;
         }
@@ -1120,16 +1067,30 @@ export class VirtualAgvAdapter implements AgvAdapter {
         return Math.floor(this.options.batteryMaxReach * charge / 100);
     }
 
+    /**
+     * Checks whether a given number is lesser than or equal some other number, but
+     * accounts for possible floating point imprecision.
+     * 
+     * @param lhs a given number
+     * @param rhs a given number
+     * @param epsilon epsilon value to use to account for floating point imprecision
+     * @returns lhs <= rhs
+     */
+    protected lessThanOrEqualFloat(lhs: number, rhs: number, epsilon: number = 0.001): boolean {
+        return Math.abs(lhs) < Math.abs(rhs) || Math.abs(lhs - rhs) < epsilon;
+    }
+
     /* Private */
 
     private _optionsWithDefaults(options: VirtualAgvAdapterOptions): Required<VirtualAgvAdapterOptions> {
         const optionalDefaults: Required<Optional<VirtualAgvAdapterOptions>> = {
-            initialPosition: { mapId: "local", x: 0, y: 0, theta: 0, lastNodeId: "0" },
+            initialPosition: { mapId: "local", x: 0, y: 0, theta: 0 },
             agvNormalDeviationXyTolerance: 0.5,
             agvNormalDeviationThetaTolerance: 0.349066,
             vehicleSpeed: 2,
             vehicleSpeedDistribution: undefined,
             vehicleTimeDistribution: undefined,
+            batteryCapacity: 100,
             batteryMaxReach: 28800,
             initialBatteryCharge: 100,
             fullBatteryChargeTime: 1,
@@ -1171,9 +1132,17 @@ export class VirtualAgvAdapter implements AgvAdapter {
         }
 
         const traverseContext = this._traverseContext;
-        const endNodePosition = traverseContext.endNode.nodePosition;
-        const tx = endNodePosition.x - this._vehicleState.position.x;
-        const ty = endNodePosition.y - this._vehicleState.position.y;
+
+        // var endNodePos = getLocFromNodeId(traverseContext.endNode);     // ToDo Implement function to search list of all nodes and get there X and Y Pos {x: 1, y: 1, theta: ?}
+        var endNodePosX: number = getEndLocPosX(traverseContext.endNode.nodeId);
+        var endNodePosY: number = getEndLocPosY(traverseContext.endNode.nodeId);
+        if(!endNodePosX || !endNodePosY)
+        {
+            console.log("NodeId: " + traverseContext.endNode.nodeId + " not found!");
+            return;
+        }
+        const tx = endNodePosX - this._vehicleState.position.x;
+        const ty = endNodePosY - this._vehicleState.position.y;
         const alpha = Math.atan2(ty, tx);
 
         if (!this._vehicleState.isDriving) {
@@ -1187,13 +1156,12 @@ export class VirtualAgvAdapter implements AgvAdapter {
             const dx = this._vehicleState.velocity.vx * realInterval;
             const dy = this._vehicleState.velocity.vy * realInterval;
 
-            if (tx ** 2 + ty ** 2 <= dx ** 2 + dy ** 2) {
-                this._vehicleState.position.x = endNodePosition.x;
-                this._vehicleState.position.y = endNodePosition.y;
-                this._vehicleState.position.theta = endNodePosition.theta ?? this._vehicleState.position.theta;
+            if (this.lessThanOrEqualFloat(tx, dx) && this.lessThanOrEqualFloat(ty, dy)) {
+                this._vehicleState.position.x = endNodePosX;
+                this._vehicleState.position.y = endNodePosY;
+                this._vehicleState.position.theta = 0 ?? this._vehicleState.position.theta;
                 this.updateBatteryState(tx, ty);
-                const { lastNodeId: _, ...position } = this._vehicleState.position;
-                this.controller.updateAgvPositionVelocity(position);
+                this.controller.updateAgvPositionVelocity(this._vehicleState.position);
                 this.stopDriving(true);
                 this._traverseContext = undefined;
                 traverseContext.edgeTraversed();
@@ -1203,11 +1171,10 @@ export class VirtualAgvAdapter implements AgvAdapter {
                 this._vehicleState.position.y += dy;
                 this._vehicleState.position.theta = traverseContext.edge.orientation ?? alpha;
                 this.updateBatteryState(dx, dy);
-                const { lastNodeId: _, ...position } = this._vehicleState.position;
-                this.controller.updateAgvPositionVelocity(position);
+                this.controller.updateAgvPositionVelocity(this._vehicleState.position);
 
                 if (isBatteryLow) {
-                    this.debug("low battery charge %d", this._vehicleState.batteryState.batteryCharge);
+                    console.log("low battery charge %d", this._vehicleState.batteryState.batteryCharge);
                     this.stopDriving();
                     // Report an error that is reverted on charging (see _advanceBatteryCharge).
                     this._batteryLowError = {
@@ -1237,13 +1204,11 @@ export class VirtualAgvAdapter implements AgvAdapter {
         const currentCharge = this._vehicleState.batteryState.batteryCharge;
         const deltaCharge = chargeRate * realInterval;
         const newCharge = Math.min(100, currentCharge + deltaCharge);
-        const isFullyCharged = newCharge === 100;
+        const isFullyCharged = newCharge > 99;
 
-        // Update charge and reach and propagate new battery state to AGV so
-        // that it is sent to master control on the next regular state emission.
+        // Update charge and reach.
         this._vehicleState.batteryState.batteryCharge = newCharge;
         this._vehicleState.batteryState.reach = this.getBatteryReach(newCharge);
-        this.controller.updateBatteryState(this._vehicleState.batteryState, false);
 
         // Remove batteryLowError from state as soon as charge is 10% above threshold.
         let batteryLowError: Error;
@@ -1252,8 +1217,7 @@ export class VirtualAgvAdapter implements AgvAdapter {
             this._batteryLowError = undefined;
         }
 
-        // Additionally report regular state of charge updates with low
-        // frequency (in steps of 1%).
+        // Report state of charge updates with low frequency (in steps of 1%).
         const updateTicks = Math.ceil(1000 / chargeRate / tickInterval);
         if (tick % updateTicks === 0) {
             batteryLowError && this.controller.updateErrors(batteryLowError, "remove");
@@ -1274,14 +1238,14 @@ export class VirtualAgvAdapter implements AgvAdapter {
             loadDimensions: { width: 1, height: 1, length: 1 },
             weight: 10 + 10 * Math.random(),
         };
-        this.debug("picked load", this._vehicleState.currentLoad);
+        console.log("picked load", this._vehicleState.currentLoad);
         return {
             loads: [this._vehicleState.currentLoad],
         };
     }
 
     private _loadRemoved(): Partial<Headerless<State>> {
-        this.debug("dropped load", this._vehicleState.currentLoad);
+        console.log("dropped load", this._vehicleState.currentLoad);
         this._vehicleState.currentLoad = undefined;
         return {
             loads: [],
@@ -1293,14 +1257,14 @@ export class VirtualAgvAdapter implements AgvAdapter {
         this._vehicleState.position.y = action.actionParameters.find(p => p.key === "y").value as number;
         this._vehicleState.position.theta = action.actionParameters.find(p => p.key === "theta").value as number;
         this._vehicleState.position.mapId = action.actionParameters.find(p => p.key === "mapId").value as string;
-        this._vehicleState.position.lastNodeId = action.actionParameters.find(p => p.key === "lastNodeId").value as string;
+        const lastNodeId = action.actionParameters.find(p => p.key === "lastNodeId").value as string;
         const lastNodeSequenceId = action.actionParameters.find(p => p.key === "lastNodeSequenceId")?.value as number;
-        const { lastNodeId, ...position } = this._vehicleState.position;
 
-        this.debug("init position %o with lastNodeId %s and lastNodeSequenceId %d", position, lastNodeId, lastNodeSequenceId);
+        console.log("init position %o with lastNodeId %s and lastNodeSequenceId %d",
+            this._vehicleState.position, lastNodeId, lastNodeSequenceId);
 
         return {
-            agvPosition: position,
+            agvPosition: this._vehicleState.position,
             lastNodeId,
             lastNodeSequenceId: lastNodeSequenceId ?? 0,
         };
@@ -1314,7 +1278,7 @@ export class VirtualAgvAdapter implements AgvAdapter {
         if (this._vehicleState.isDriving) {
             this.stopDriving();
         }
-        this.debug("start pause");
+        console.log("start pause");
         this._vehicleState.isPaused = true;
         // Pause all actions except this one.
         for (const asm of this._actionStateMachines) {
@@ -1329,7 +1293,7 @@ export class VirtualAgvAdapter implements AgvAdapter {
         if (!this._vehicleState.isPaused) {
             return undefined;
         }
-        this.debug("stop pause");
+        console.log("stop pause");
         this._vehicleState.isPaused = false;
 
         if (context !== undefined) {
@@ -1353,7 +1317,7 @@ export class VirtualAgvAdapter implements AgvAdapter {
         if (this._vehicleState.isDriving) {
             this.stopDriving();
         }
-        this.debug("start charging");
+        console.log("start charging");
         this._vehicleState.batteryState.charging = true;
         return { batteryState: this._vehicleState.batteryState };
     }
@@ -1362,7 +1326,7 @@ export class VirtualAgvAdapter implements AgvAdapter {
         if (!this._vehicleState.batteryState.charging) {
             return undefined;
         }
-        this.debug("stop charging");
+        console.log("stop charging");
         this._vehicleState.batteryState.charging = false;
         return { batteryState: this._vehicleState.batteryState };
     }
@@ -1382,7 +1346,7 @@ export class VirtualAgvAdapter implements AgvAdapter {
         } catch {
             results.splice(0, results.length);
         }
-        this.debug("calculated estimated order execution times: %o", results);
+        console.log("calculated estimated order execution times: %o", results);
         return results.join(",");
     }
 
@@ -1413,25 +1377,6 @@ export class VirtualAgvAdapter implements AgvAdapter {
         }
         return edgeTraversalTime + effectiveActionDuration;
     }
-}
-
-function getTransitionDuration(transition: any, action: Action) {
-    if ("durationTime" in transition) {
-        if (typeof transition.durationTime === "number") {
-            return transition.durationTime;
-        }
-        if (Array.isArray(transition.durationTime) &&
-            typeof transition.durationTime[0] === "string" &&
-            typeof transition.durationTime[1] === "number") {
-            const param = transition.durationTime[0];
-            const kv = action.actionParameters?.find(p => p.key === param);
-            if (kv !== undefined) {
-                return kv.value;
-            }
-            return transition.durationTime[1];
-        }
-    }
-    return undefined;
 }
 
 /**
@@ -1533,10 +1478,10 @@ class VirtualActionStateMachine {
         let duration = this._statusDurationTimes.get(this._actionStatus);
         duration += realInterval;
 
-        const transitionDuration = getTransitionDuration(actionStatusDef, this.actionContext.action);
-        if (transitionDuration !== undefined && duration >= transitionDuration) {
+        const { next, durationTime } = actionStatusDef as { next: ActionStatus, durationTime: number };
+        if (durationTime !== undefined && duration >= durationTime) {
             this._statusDurationTimes.set(this._actionStatus, 0);
-            this._transition({ actionStatus: actionStatusDef.next });
+            this._transition({ actionStatus: next });
         } else {
             this._statusDurationTimes.set(this._actionStatus, duration);
         }
@@ -1552,7 +1497,7 @@ class VirtualActionStateMachine {
         if (this.actionContext.scope !== "edge" || this._shouldTerminate !== false) {
             return;
         }
-        this._debug("should terminate action %o", this.actionContext);
+        console.log("should terminate action %o", this.actionContext);
         this._shouldTerminate = true;
     }
 
@@ -1567,7 +1512,7 @@ class VirtualActionStateMachine {
         if (this.actionContext.scope === "instant" || this._shouldCancel !== false || !this.actionDefinition.transitions.ON_CANCEL) {
             return;
         }
-        this._debug("should cancel action %o", this.actionContext);
+        console.log("should cancel action %o", this.actionContext);
         this._shouldCancel = true;
     }
 
@@ -1576,7 +1521,7 @@ class VirtualActionStateMachine {
      * action status PAUSED.
      */
     pause() {
-        this._debug("should pause action %o", this.actionContext);
+        console.log("should pause action %o", this.actionContext);
         this._shouldPause = true;
     }
 
